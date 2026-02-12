@@ -1,62 +1,69 @@
 defmodule Peep.Storage.ETS do
   @moduledoc """
-  Peep.Storage implementation using a single ETS table.
+  Peep.Storage implementation using two ETS tables.
 
-  A sane default for storing Peep metrics, with some simple optimizations.
-  If you discover that lock contention on Peep's ETS table is high,
-  consider switching to `Peep.Storage.Striped`, which reduces lock contention
-  at the cost of higher memory usage.
+  Counters, sums, and last values are stored in a main table optimized for
+  concurrent writes (`write_concurrency: true`).
+
+  Distributions are stored in a separate table with `read_concurrency: true`,
+  since after the initial insert of an atomics struct, subsequent operations
+  are predominantly reads (lookups) followed by lock-free atomics updates.
   """
   alias Peep.Storage
   alias Telemetry.Metrics
 
   @behaviour Peep.Storage
 
-  @spec new(term) :: :ets.tid()
   @impl true
   def new(_) do
-    opts = [
-      :public,
-      # Enabling read_concurrency makes switching between reads and writes
-      # more expensive. The goal is to ruthlessly optimize writes, even at
-      # the cost of read performance.
-      read_concurrency: false,
-      write_concurrency: true,
-      decentralized_counters: true
-    ]
+    main =
+      :ets.new(__MODULE__, [
+        :public,
+        read_concurrency: false,
+        write_concurrency: true,
+        decentralized_counters: true
+      ])
 
-    :ets.new(__MODULE__, opts)
+    dist =
+      :ets.new(:peep_distributions, [
+        :public,
+        read_concurrency: true,
+        write_concurrency: false
+      ])
+
+    {main, dist}
   end
 
   @impl true
-  def storage_size(tid) do
+  def storage_size({main, dist}) do
     %{
-      size: :ets.info(tid, :size),
-      memory: :ets.info(tid, :memory) * :erlang.system_info(:wordsize)
+      size: :ets.info(main, :size) + :ets.info(dist, :size),
+      memory:
+        (:ets.info(main, :memory) + :ets.info(dist, :memory)) * :erlang.system_info(:wordsize)
     }
   end
 
   @impl true
-  def insert_metric(tid, id, %Metrics.Counter{}, _value, %{} = tags) do
+  def insert_metric({main, _dist}, id, %Metrics.Counter{}, _value, %{} = tags) do
     key = {id, tags, :erlang.system_info(:scheduler_id)}
-    :ets.update_counter(tid, key, {2, 1}, {key, 0})
+    :ets.update_counter(main, key, {2, 1}, {key, 0})
   end
 
-  def insert_metric(tid, id, %Metrics.Sum{}, value, %{} = tags) do
+  def insert_metric({main, _dist}, id, %Metrics.Sum{}, value, %{} = tags) do
     key = {id, tags, :erlang.system_info(:scheduler_id)}
-    :ets.update_counter(tid, key, {2, value}, {key, 0})
+    :ets.update_counter(main, key, {2, value}, {key, 0})
   end
 
-  def insert_metric(tid, id, %Metrics.LastValue{}, value, %{} = tags) do
+  def insert_metric({main, _dist}, id, %Metrics.LastValue{}, value, %{} = tags) do
     key = {id, tags}
-    :ets.insert(tid, {key, value})
+    :ets.insert(main, {key, value})
   end
 
-  def insert_metric(tid, id, %Metrics.Distribution{} = metric, value, %{} = tags) do
+  def insert_metric({_main, dist}, id, %Metrics.Distribution{} = metric, value, %{} = tags) do
     key = {id, tags}
 
     atomics =
-      case :ets.lookup(tid, key) do
+      case :ets.lookup(dist, key) do
         [{_key, ref}] ->
           ref
 
@@ -67,12 +74,12 @@ defmodule Peep.Storage.ETS do
           # increment.
           new_atomics = Storage.Atomics.new(metric)
 
-          case :ets.insert_new(tid, {key, new_atomics}) do
+          case :ets.insert_new(dist, {key, new_atomics}) do
             true ->
               new_atomics
 
             false ->
-              [{_key, atomics}] = :ets.lookup(tid, key)
+              [{_key, atomics}] = :ets.lookup(dist, key)
               atomics
           end
       end
@@ -81,61 +88,64 @@ defmodule Peep.Storage.ETS do
   end
 
   @impl true
-  def get_all_metrics(tid, %Peep.Persistent{ids_to_metrics: itm}) do
-    :ets.tab2list(tid)
+  def get_all_metrics({main, dist}, %Peep.Persistent{ids_to_metrics: itm}) do
+    :ets.tab2list(main)
     |> group_metrics(itm, %{})
+    |> then(fn acc ->
+      :ets.tab2list(dist)
+      |> group_metrics(itm, acc)
+    end)
   end
 
   @impl true
-  def get_metric(tid, id, %Metrics.Counter{}, tags) do
-    :ets.select(tid, [{{{id, :"$2", :_}, :"$1"}, [{:==, :"$2", tags}], [:"$1"]}])
+  def get_metric({main, _dist}, id, %Metrics.Counter{}, tags) do
+    :ets.select(main, [{{{id, :"$2", :_}, :"$1"}, [{:==, :"$2", tags}], [:"$1"]}])
     |> Enum.reduce(0, fn count, acc -> count + acc end)
   end
 
-  def get_metric(tid, id, %Metrics.Sum{}, tags) do
-    :ets.select(tid, [{{{id, :"$2", :_}, :"$1"}, [{:==, :"$2", tags}], [:"$1"]}])
+  def get_metric({main, _dist}, id, %Metrics.Sum{}, tags) do
+    :ets.select(main, [{{{id, :"$2", :_}, :"$1"}, [{:==, :"$2", tags}], [:"$1"]}])
     |> Enum.reduce(0, fn count, acc -> count + acc end)
   end
 
-  def get_metric(tid, id, %Metrics.LastValue{}, tags) do
-    case :ets.lookup(tid, {id, tags}) do
+  def get_metric({main, _dist}, id, %Metrics.LastValue{}, tags) do
+    case :ets.lookup(main, {id, tags}) do
       [{_key, value}] -> value
       _ -> nil
     end
   end
 
-  def get_metric(tid, id, %Metrics.Distribution{}, tags) do
+  def get_metric({_main, dist}, id, %Metrics.Distribution{}, tags) do
     key = {id, tags}
 
-    case :ets.lookup(tid, key) do
+    case :ets.lookup(dist, key) do
       [{_key, atomics}] -> Storage.Atomics.values(atomics)
       _ -> nil
     end
   end
 
   @impl true
-  def prune_tags(tid, patterns) do
-    match_spec =
+  def prune_tags({main, dist}, patterns) do
+    main_match_spec =
       patterns
       |> Enum.flat_map(fn pattern ->
         counter_or_sum_key = {:_, pattern, :_}
-        dist_or_last_value_key = {:_, pattern}
+        last_value_key = {:_, pattern}
 
         [
-          {
-            {counter_or_sum_key, :_},
-            [],
-            [true]
-          },
-          {
-            {dist_or_last_value_key, :_},
-            [],
-            [true]
-          }
+          {{counter_or_sum_key, :_}, [], [true]},
+          {{last_value_key, :_}, [], [true]}
         ]
       end)
 
-    :ets.select_delete(tid, match_spec)
+    dist_match_spec =
+      patterns
+      |> Enum.flat_map(fn pattern ->
+        [{{{:_, pattern}, :_}, [], [true]}]
+      end)
+
+    :ets.select_delete(main, main_match_spec)
+    :ets.select_delete(dist, dist_match_spec)
     :ok
   end
 
